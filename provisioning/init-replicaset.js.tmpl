@@ -7,5 +7,5 @@ var cfg = { _id: "${replicaSetName}",
     ]
 };
 
-var error = rs.initiate(cfg);
+var error = rs.reconfig(cfg, {"force": true});
 printjson(error);
