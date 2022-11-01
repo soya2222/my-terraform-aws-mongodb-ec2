@@ -49,6 +49,43 @@ resource "aws_instance" "mongo_server" {
   }
 }
 
+resource "aws_instance" "mongo_server_arbiter" {
+  ami                         = local.ami_id
+  instance_type               = var.instance_type
+  subnet_id                   = var.subnet_id
+  vpc_security_group_ids      = [aws_security_group.sg_mongodb.id]
+  key_name                    = aws_key_pair.mongo_keypair.key_name
+  availability_zone           = var.data_volumes[0].availability_zone
+  associate_public_ip_address = false
+
+  tags = {
+    Name = "arbiter"
+  }
+
+  connection {
+    host         = var.bastion_host == "" ? self.public_ip : self.private_ip
+    type         = "ssh"
+    user         = var.ssh_user
+    private_key  = var.private_key
+    bastion_host = var.bastion_host
+    agent        = true
+  }
+
+  provisioner "file" {
+    source      = "${path.module}/provisioning/wait-for-cloud-init.sh"
+    destination = "/tmp/wait-for-cloud-init.sh"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "sudo ln -s /usr/bin/python3 /usr/bin/python",
+      "chmod +x /tmp/wait-for-cloud-init.sh",
+      "/tmp/wait-for-cloud-init.sh",
+    ]
+  }
+}
+
+
 resource "aws_volume_attachment" "mongo-data-vol-attachment" {
   count       = local.replica_count
   device_name = local.device_name
@@ -92,13 +129,43 @@ resource "aws_volume_attachment" "mongo-data-vol-attachment" {
   }
 }
 
+resource "null_resource" "arbiter_initialization" {
+  depends_on = [
+    aws_instance.mongo_server_arbiter
+  ]
+
+  connection {
+    host         = var.bastion_host == "" ? aws_instance.mongo_server_arbiter.public_ip : aws_instance.mongo_server_arbiter.private_ip
+    type         = "ssh"
+    user         = var.ssh_user
+    private_key  = var.private_key
+    bastion_host = var.bastion_host
+    agent        = true
+  }
+
+  provisioner "ansible" {
+    plays {
+      playbook {
+        file_path = "${path.module}/provisioning/playbook.yaml"
+      }
+      extra_vars = {
+        mongodb_version             = var.mongodb_version
+        mongodb_replication_replset = var.replicaset_name
+      }
+      groups = local.ansible_host_group
+    }
+  }
+}
+
 resource "null_resource" "replicaset_initialization" {
-  depends_on = [aws_volume_attachment.mongo-data-vol-attachment]
+  depends_on = [aws_volume_attachment.mongo-data-vol-attachment,
+  null_resource.arbiter_initialization]
 
   provisioner "file" {
     content = templatefile("${path.module}/provisioning/init-replicaset.js.tmpl", {
       replicaSetName = var.replicaset_name
-      ip_addrs       = aws_instance.mongo_server.*.public_ip
+      ip_addrs       = var.bastion_host == "" ? aws_instance.mongo_server.*.public_ip : aws_instance.mongo_server.*.private_ip
+      arbiterAddr    = aws_instance.mongo_server_arbiter.private_ip
     })
     destination = "/tmp/init-replicaset.js"
   }
